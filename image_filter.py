@@ -9,20 +9,27 @@ client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 def filter_images(images, description):
     prompt = f"""
-    You're Daisy—a visual identity expert, stylist, and creative director. You have detailed context about the user:
-
-    {description}
-
-    Given this context, select the 5 most visually aligned images from this set:
-
-    {images}
-
-    Prioritize:
-    - Style consistency (matches user's desired vibe and aesthetic)
-    - Authenticity (reflects real, wearable looks inspired by the mentioned celebrity or archetype)
-    - Relevance to user's body shape and occasion
-
-    Return ONLY a JSON array of URLs: ["url1", "url2", ...]
+        You're Daisy—a visual identity expert and stylist.
+    
+        Given the user's described vibe and aesthetic:
+    
+        {description}
+    
+        Select the 8 best-aligned images from these candidates:
+    
+        {images}
+    
+        ✅ Prioritize images that:
+        - Clearly match the user's requested style and aesthetic.
+        - Have natural lighting, realistic environments, and high visual quality.
+        - Feature full-body or half-body outfits, visibly styled.
+    
+        🚫 Exclude images that:
+        - Contain any text, prices, overlays, watermarks, or logos.
+        - Are collages, editorial campaigns, ads, runways, or overly stylized/editorial poses.
+        - Appear low-resolution, overly posed, or artificial.
+    
+        Return ONLY a JSON array of image URLs: ["url1", "url2", ...]
     """
 
     response = client.chat.completions.create(

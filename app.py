@@ -26,6 +26,23 @@ def chat():
 
     print("[LOG] Received request:", data)
 
+    if 'conversationQueue' not in data:
+        data['conversationQueue'] = []
+
+    conversation_queue = data['conversationQueue']
+
+    if conversation_queue:
+        # If there are queued messages, send next one directly
+        next_message = conversation_queue.pop(0)
+        response = {
+            "threadId": thread_id,
+            "onboarding": True,
+            "message": next_message,
+            "conversationQueue": conversation_queue  # return updated queue to frontend
+        }
+        print("[LOG] Sending queued message:", response)
+        return jsonify(response)
+
     thread_id, assistant_reply = create_or_continue_thread(thread_id, user_message)
     print("[LOG] Daisy Assistant reply:", assistant_reply)
 
@@ -33,23 +50,24 @@ def chat():
     print("[LOG] Onboarding complete status:", onboarding_complete)
 
     if onboarding_complete:
+        search_query = None
         if "Onboarding complete. Here's your search query:" in assistant_reply:
             search_query = assistant_reply.split("Onboarding complete. Here's your search query:")[1].strip()
             print("[LOG] Extracted search query:", search_query)
-        else:
-            print("[ERROR] Onboarding completion phrase found, but query extraction failed.")
-            search_query = None
 
         if search_query:
+            celebs, keywords = parse_search_query(search_query)
+
             images_response = requests.get(
                 f"{GOOGLE_AGENT_URL}/search-google-images",
-                params={"q": search_query}
+                params={
+                    "celebs": ",".join(celebs),
+                    "keywords": ",".join(keywords)
+                }
             ).json()
-            print("[LOG] Images fetched from Google Agent:", images_response)
 
             images = images_response.get('images', [])
             filtered_images = filter_images(images, search_query)
-            print("[LOG] Images after GPT-4 Vision filtering:", filtered_images)
 
             response = {
                 "threadId": thread_id,
@@ -66,16 +84,34 @@ def chat():
             }
             print("[LOG] Final response:", response)
             return jsonify(response)
-        else:
-            print("[ERROR] Search query was None. Not proceeding to image search.")
+
+    # Properly split assistant reply into individual messages/questions clearly:
+    split_messages = [msg.strip() for msg in assistant_reply.strip().split("\n\n") if msg.strip()]
+    next_message = split_messages.pop(0)
 
     response = {
         "threadId": thread_id,
         "onboarding": True,
-        "message": assistant_reply
+        "message": next_message,
+        "conversationQueue": split_messages  # queue remaining questions
     }
-    print("[LOG] Onboarding response:", response)
+    print("[LOG] Single-question onboarding response with queue:", response)
     return jsonify(response)
+
+def parse_search_query(search_query):
+    known_celebrities = ['Hailey Bieber', 'Kendall Jenner', 'Jacob Elordi', 'Paul Mescal']
+    celebs = []
+    keywords = []
+
+    for celeb in known_celebrities:
+        if celeb.lower() in search_query.lower():
+            celebs.append(celeb)
+            search_query = search_query.lower().replace(celeb.lower(), "").strip()
+
+    keywords = search_query.split()
+    return celebs, keywords
+
+
 
 if __name__ == '__main__':
     print("[LOG] Starting Daisy backend...")
