@@ -1,12 +1,26 @@
 modules = ["python-3.12"]
 
+run = "python3 app.py"
+
 [nix]
 channel = "stable-24_05"
 
-[[ports]]
-localPort = 8000
-externalPort = 80
+[env]
+PORT = "5000"
 
 [[ports]]
-localPort = 8080
-externalPort = 8080
+localPort = 5000
+externalPort = 80
+
+[workflows]
+runButton = "Run"
+
+[[workflows.workflow]]
+name = "Run"
+author = 28026932
+mode = "sequential"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "python3 app.py"
+
