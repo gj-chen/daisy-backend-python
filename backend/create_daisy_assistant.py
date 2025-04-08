@@ -21,14 +21,14 @@ def create_daisy_assistant():
             {
                 "type": "function",
                 "function": {
-                    "name": "search_pinterest",
-                    "description": "Search Pinterest for visual inspiration based on the stylist's query",
+                    "name": "search_curated_images",
+                    "description": "Search curated fashion images from Daisy’s internal moodboard database",
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "query": {
                                 "type": "string",
-                                "description": "The search string to use for Pinterest, e.g., 'linen midi dress summer wedding'"
+                                "description": "A short 1–2 sentence style summary to guide the image search"
                             }
                         },
                         "required": ["query"]
@@ -41,6 +41,7 @@ def create_daisy_assistant():
 
     print("✅ Assistant created:")
     print("ID:", assistant.id)
+
 
 if __name__ == "__main__":
     create_daisy_assistant()

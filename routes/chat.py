@@ -1,14 +1,13 @@
 # routes/chat.py
 import os
 import requests
-from flask import Blueprint, request, jsonify
+from flask import request, jsonify
 from openai import OpenAI
 from dotenv import load_dotenv
 import json
 
 load_dotenv()
 
-router = Blueprint("chat", __name__)
 openai = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 ASSISTANT_ID = os.getenv("DAISY_ASSISTANT_ID")
