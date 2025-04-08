@@ -1,7 +1,9 @@
-Flask==3.1.0
-requests==2.32.0
-beautifulsoup4==4.13.3
-python-dotenv==1.1.0
-gunicorn==23.0.0
-openai
+Flask
+requests
+beautifulsoup4
+python-dotenv
+gunicorn
+openai>=1.3.0
 flask-cors
+supabase
+psycopg2-binary
