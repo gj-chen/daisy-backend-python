@@ -27,10 +27,10 @@ client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 ASSISTANT_ID = os.getenv("DAISY_ASSISTANT_ID")
 
 
-# Thread tracking
-THREADS = {}
-STYLE_SUMMARIES = {}  # maps user_id → last style_summary
-LAST_REPLY = {}       # tracks last assistant reply per user
+USER_CONTEXTS = {}  # user_id -> { last_user, last_daisy }
+STYLE_SUMMARIES = {}  # user_id -> current style summary
+THREADS = {}  # user_id -> OpenAI thread ID
+LAST_MESSAGE_ID = {}  # user_id -> last assistant message ID
 
 # Database connection
 def get_pg_connection():
@@ -112,6 +112,25 @@ Only return the updated summary.
 
     return response.choices[0].message.content.strip()
 
+def get_context_from_state(user_id: str, user_message: str) -> str:
+    style_summary = STYLE_SUMMARIES.get(user_id, "")
+    last_daisy = USER_CONTEXTS.get(user_id, {}).get("last_daisy", "")
+
+    context_lines = []
+    if style_summary:
+        context_lines.append(f"The user's current style direction: {style_summary}")
+    if last_daisy:
+        context_lines.append(f"Daisy's last message: {last_daisy}")
+    context_lines.append(f"The user's latest message: {user_message}")
+
+    return (
+        "You are Daisy, a warm and intuitive personal stylist. "
+        "Please continue the conversation naturally, focusing on the user's latest message. "
+        "Be thoughtful, stylish, and emotionally intelligent. Avoid repeating earlier phrases.\n\n"
+        + "\n".join(context_lines)
+    )
+
+
 @app.route("/chat", methods=["POST"])
 def chat_with_daisy():
     data = request.get_json()
@@ -119,14 +138,20 @@ def chat_with_daisy():
     user_message = data.get("message")
     print(f"[LOG] Message from '{user_id}': {user_message}")
 
+    USER_CONTEXTS[user_id] = USER_CONTEXTS.get(user_id, {})
+    USER_CONTEXTS[user_id]["last_user"] = user_message
+
     thread_id = THREADS.get(user_id)
     if not thread_id:
         thread = client.beta.threads.create()
         thread_id = thread.id
         THREADS[user_id] = thread_id
-    client.beta.threads.messages.create(thread_id=thread_id, role="user", content=user_message)
-    run = client.beta.threads.runs.create(thread_id=thread_id, assistant_id=ASSISTANT_ID)
 
+    # Compose focused prompt for Daisy
+    context_prompt = get_context_from_state(user_id, user_message)
+    client.beta.threads.messages.create(thread_id=thread_id, role="user", content=context_prompt)
+
+    run = client.beta.threads.runs.create(thread_id=thread_id, assistant_id=ASSISTANT_ID)
     while run.status in ["queued", "in_progress"]:
         run = client.beta.threads.runs.retrieve(thread_id=thread_id, run_id=run.id)
 
@@ -141,48 +166,43 @@ def chat_with_daisy():
             if tool_call.function.name == "search_curated_images":
                 tool_used = True
                 query = args.get("query")
-                print(f"[TOOL] Daisy tool call — search_curated_images: {query}")
                 STYLE_SUMMARIES[user_id] = query
-                try:
-                    results = search_images_from_db(query, user_id)
-                    frontend_images = results
-                    image_rationales = [{"url": img["url"], "rationale": img["explanation"]} for img in results]
-                    tool_outputs.append({
-                        "tool_call_id": tool_call.id,
-                        "output": json.dumps({ "images": results or [] })
-                    })
-                except Exception as e:
-                    print(f"[ERROR] image search failed: {e}")
-                    tool_outputs.append({
-                        "tool_call_id": tool_call.id,
-                        "output": json.dumps({ "images": [] })
-                    })
+                results = search_images_from_db(query, user_id)
+                frontend_images = results
+                image_rationales = [
+                    {"url": img["url"], "rationale": img["explanation"]} for img in results
+                ]
+                tool_outputs.append({
+                    "tool_call_id": tool_call.id,
+                    "output": json.dumps({"images": results or []})
+                })
 
         run = client.beta.threads.runs.submit_tool_outputs(
             thread_id=thread_id, run_id=run.id, tool_outputs=tool_outputs
         )
-
         while run.status in ["queued", "in_progress", "requires_action"]:
             run = client.beta.threads.runs.retrieve(thread_id=thread_id, run_id=run.id)
 
-    # Final reply logic
     messages = client.beta.threads.messages.list(thread_id=thread_id)
-    
     assistant_reply = ""
+    assistant_message_id = None
+
     for m in reversed(messages.data):
         if m.role == "assistant" and m.content:
+            assistant_message_id = m.id
             raw = m.content[0].text.value.strip()
+            if LAST_MESSAGE_ID.get(user_id) == assistant_message_id:
+                print("[DEBUG] Skipping repeated assistant message.")
+                break
             lines = raw.splitlines()
             clean = [line for line in lines if "http" not in line and not line.startswith("-")]
             assistant_reply = "\n".join(clean).strip()
-
-            # Check for repetition
-            last_used = LAST_REPLY.get(user_id, "")
-            if assistant_reply == last_used:
-                assistant_reply += "\nLet me take a fresh look at this with you."
             break
 
-    LAST_REPLY[user_id] = assistant_reply
+    if assistant_message_id:
+        LAST_MESSAGE_ID[user_id] = assistant_message_id
+
+    USER_CONTEXTS[user_id]["last_daisy"] = assistant_reply
 
     def split_message(text, max_len=280):
         sentences = re.split(r'(?<=[.!?]) +', text.strip())
@@ -200,9 +220,10 @@ def chat_with_daisy():
     return jsonify({
         "messages": [{"role": "assistant", "text": t} for t in split_message(assistant_reply)],
         "threadId": thread_id,
-        "moodboard": { "images": image_rationales },
-        "toolUsed": tool_used  # ✅ now included
+        "moodboard": {"images": image_rationales},
+        "toolUsed": tool_used
     })
+
 
 def search_images_from_db(query, user_id):
     embedding = get_embedding_from_text(query)
