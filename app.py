@@ -1,7 +1,6 @@
 import os
 import uuid
 import json
-import requests
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from dotenv import load_dotenv
@@ -114,6 +113,7 @@ def split_message(text, max_group_len=280):
 
     return chunks
 
+
 @app.route("/chat", methods=["POST"])
 def chat_with_daisy():
     print(f"[DEBUG] Using Assistant ID: {ASSISTANT_ID}")
@@ -135,12 +135,14 @@ def chat_with_daisy():
     else:
         print(f"[LOG] Using thread: {thread_id}")
 
+    # Add user message to thread
     client.beta.threads.messages.create(
         thread_id=thread_id,
         role="user",
         content=user_message
     )
 
+    # Initial assistant run
     run = client.beta.threads.runs.create(
         thread_id=thread_id,
         assistant_id=ASSISTANT_ID,
@@ -149,23 +151,14 @@ def chat_with_daisy():
     while run.status in ["queued", "in_progress"]:
         run = client.beta.threads.runs.retrieve(thread_id=thread_id, run_id=run.id)
 
-    print(f"[RUN STATUS] {run.status}")
-
-    # Log tool calls if required
-    if run.status == "requires_action":
-        print("[REQUIRES ACTION]")
-        if run.required_action.type == "submit_tool_outputs":
-            tool_calls = run.required_action.submit_tool_outputs.tool_calls
-            print(f"[TOOL CALLS RECEIVED]: {len(tool_calls)}")
-            for tool_call in tool_calls:
-                print(f"[TOOL REQUESTED]: {tool_call.function.name} — Args: {tool_call.function.arguments}")
-        else:
-            print("[REQUIRES ACTION] But not a tool call.")
-
     tool_outputs = []
+    frontend_images = []
+    image_rationales = []
 
+    # Handle tool call like search_curated_images
     if run.status == "requires_action" and run.required_action.type == "submit_tool_outputs":
-        for tool_call in run.required_action.submit_tool_outputs.tool_calls:
+        tool_calls = run.required_action.submit_tool_outputs.tool_calls
+        for tool_call in tool_calls:
             tool_call_id = tool_call.id
             function_name = tool_call.function.name
             arguments = json.loads(tool_call.function.arguments)
@@ -173,12 +166,15 @@ def chat_with_daisy():
             if function_name == "search_curated_images":
                 query = arguments.get("query")
                 print(f"[TOOL] Daisy wants to search curated images for: {query}")
-
-                # Track original style summary
                 STYLE_SUMMARIES[user_id] = query
 
                 try:
                     image_results = search_images_from_db(query, user_id)
+                    frontend_images = image_results
+                    image_rationales = [
+                        {"url": img["url"], "rationale": img["explanation"]}
+                        for img in image_results
+                    ]
                     tool_outputs.append({
                         "tool_call_id": tool_call_id,
                         "output": json.dumps({ "images": image_results or [] })
@@ -190,41 +186,63 @@ def chat_with_daisy():
                         "output": json.dumps({ "images": [] })
                     })
 
+        # Submit tool results
         run = client.beta.threads.runs.submit_tool_outputs(
             thread_id=thread_id,
             run_id=run.id,
             tool_outputs=tool_outputs
         )
 
-        while run.status in ["queued", "in_progress"]:
+        # Wait for Daisy's follow-up message
+        while run.status in ["queued", "in_progress", "requires_action"]:
             run = client.beta.threads.runs.retrieve(thread_id=thread_id, run_id=run.id)
 
-    # Final message parsing
+    # Get final assistant message (cleaned of markdown/image lines)
     messages = client.beta.threads.messages.list(thread_id=thread_id)
-    full_text = ""
-    for m in messages.data:
+    assistant_reply = ""
+
+    for m in reversed(messages.data):
         if m.role == "assistant" and m.content:
-            full_text = m.content[0].text.value.strip()
-            break
+            raw_text = m.content[0].text.value.strip()
+            lines = raw_text.splitlines()
 
-    print(f"[LOG] Daisy's full reply: {full_text}")
+            # Keep only stylist-style conversation
+            clean_lines = [
+                line for line in lines
+                if not re.match(r"^[-•\\d]", line.strip())  # filters out -, •, 1.
+                and not line.strip().startswith("![")
+                and "http" not in line
+            ]
 
-    chunks = split_message(full_text)
+            cleaned_reply = "\n".join(clean_lines).strip()
+            if cleaned_reply:
+                assistant_reply = cleaned_reply
+                break
 
-    moodboard_images = []
-    if tool_outputs:
-        try:
-            moodboard_images = json.loads(tool_outputs[-1]["output"])["images"]
-        except Exception as e:
-            print(f"[ERROR] Failed to extract images for frontend: {e}")
+    def split_message(text, max_len=280):
+        import re
+        sentences = re.split(r'(?<=[.!?]) +', text.strip())
+        chunks, chunk = [], ""
+        for s in sentences:
+            if len(chunk) + len(s) <= max_len:
+                chunk += " " + s if chunk else s
+            else:
+                chunks.append(chunk.strip())
+                chunk = s
+        if chunk:
+            chunks.append(chunk.strip())
+        return chunks
+
+    print(f"[LOG] Daisy's real reply (cleaned): {assistant_reply}")
 
     return jsonify({
-        "messages": [{"role": "assistant", "text": chunk} for chunk in chunks],
+        "messages": [{"role": "assistant", "text": t} for t in split_message(assistant_reply)],
         "threadId": thread_id,
-        "moodboard": {
-            "images": moodboard_images
-        }
+        "moodboard": { "images": image_rationales }
     })
+
+
+
 
 
 
@@ -331,7 +349,7 @@ def search_images_from_db(query, user_id):
     cursor = conn.cursor()
 
     sql = """
-    SELECT id, stored_image_url, title, source_url
+    SELECT id, stored_image_url, source_url
     FROM moodboard_items
     WHERE embedding IS NOT NULL
     ORDER BY embedding <-> %s::vector
@@ -345,7 +363,6 @@ def search_images_from_db(query, user_id):
         {
             "id": row["id"],
             "url": row["stored_image_url"],
-            "title": row.get("title", "Untitled"),
             "source_url": row.get("source_url", "")
         }
         for row in results
@@ -359,7 +376,7 @@ You are a fashion stylist. Your client described their style direction as:
 You have selected {len(image_data)} fashion images to illustrate this direction. For each image, write 1–2 short sentences explaining *why* it fits the styling goal above.
 
 Images:
-{chr(10).join(f"{i+1}. {img['title']} – {img['url']}" for i, img in enumerate(image_data))}
+{chr(10).join(f"{i+1}.{img['url']}" for i, img in enumerate(image_data))}
 
 Respond as a JSON array of objects like:
 [
