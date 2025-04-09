@@ -241,11 +241,6 @@ def chat_with_daisy():
         "moodboard": { "images": image_rationales }
     })
 
-
-
-
-
-
 # ✅ POST /search-images
 @app.route("/search-images", methods=["POST"])
 def search_images():
@@ -282,25 +277,62 @@ def generate_final_moodboard():
         data = request.get_json()
         image_urls = data.get("imageUrls", [])
         include_guide = data.get("includeStylingGuide", False)
+        user_id = data.get("userId", "default")
+        style_summary = STYLE_SUMMARIES.get(user_id, "No specific styling summary provided.")
 
         if not image_urls:
             return jsonify({"error": "No image URLs provided"}), 400
 
+        # Pull metadata for each selected image
+        conn = get_pg_connection()
+        cursor = conn.cursor()
+
+        placeholders = ','.join(['%s'] * len(image_urls))
+        sql = f"""
+            SELECT stored_image_url, metadata
+            FROM moodboard_items
+            WHERE stored_image_url IN ({placeholders});
+        """
+        cursor.execute(sql, tuple(image_urls))
+        results = cursor.fetchall()
+        conn.close()
+
+        image_metadata = [
+            {
+                "url": row["stored_image_url"],
+                "metadata": row["metadata"]
+            }
+            for row in results
+        ]
+
+        # Generate the stylist prompt
         user_prompt = f"""
-The user has selected the following images for their final moodboard:
+The user has selected the following fashion images for their final moodboard.
+Each image includes styling metadata (fit, body suitability, fabric, season, occasion, etc).
 
-{chr(10).join(image_urls)}
+Their overall styling context is:
+"{style_summary}"
 
-Please generate a final stylist summary that explains the overall vibe and aesthetic direction these images represent.
+Please:
+1. Write a 2–3 sentence summary that captures the overall aesthetic direction of this moodboard.
+2. Write a short rationale for each image explaining why it works and how it supports the moodboard direction.
 
-{"Also include a short styling guide explaining why each item works and how to wear it." if include_guide else "Keep it concise and visual without a styling guide."}
-"""
+Images:
+{json.dumps(image_metadata, indent=2)}
 
+Respond ONLY as valid JSON like this:
+{{
+  "summary": "...",
+  "rationales": ["...", "..."]
+}}
+        """.strip()
+
+        # Call Daisy
         thread = client.beta.threads.create()
         client.beta.threads.messages.create(
             thread_id=thread.id,
             role="user",
-            content=user_prompt.strip()
+            content=user_prompt
         )
 
         run = client.beta.threads.runs.create(
@@ -316,12 +348,16 @@ Please generate a final stylist summary that explains the overall vibe and aesth
                 return jsonify({"error": f"Run failed: {run_status.status}"}), 500
 
         messages = client.beta.threads.messages.list(thread_id=thread.id)
-        final_message = messages.data[0].content[0].text.value.strip()
+        gpt_response = messages.data[0].content[0].text.value.strip()
 
-        return jsonify({ "response": final_message }), 200
+        parsed = json.loads(gpt_response)
+        return jsonify(parsed), 200
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+
 
 # ✅ POST /upload-image
 @app.route('/upload-image', methods=['POST'])
@@ -353,7 +389,7 @@ def search_images_from_db(query, user_id):
     FROM moodboard_items
     WHERE embedding IS NOT NULL
     ORDER BY embedding <-> %s::vector
-    LIMIT 6;
+    LIMIT 10;
     """
     cursor.execute(sql, (embedding,))
     results = cursor.fetchall()
