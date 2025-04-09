@@ -25,17 +25,12 @@ supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 # OpenAI client
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 ASSISTANT_ID = os.getenv("DAISY_ASSISTANT_ID")
-GOOGLE_IMAGE_AGENT_URL = os.getenv("GOOGLE_IMAGE_AGENT_URL")
+
 
 # Thread tracking
 THREADS = {}
 STYLE_SUMMARIES = {}  # maps user_id → last style_summary
-
-
-# Home ping
-@app.route('/')
-def home():
-    return "✅ Daisy backend is running — assistant-powered."
+LAST_REPLY = {}       # tracks last assistant reply per user
 
 # Database connection
 def get_pg_connection():
@@ -46,6 +41,40 @@ def get_pg_connection():
         password=os.getenv("SUPABASE_DB_PASSWORD"),
         cursor_factory=RealDictCursor
     )
+
+
+@app.route('/')
+def home():
+    return "✅ Daisy backend is running — assistant-powered."
+
+
+@app.route('/test-db')
+def test_db():
+    try:
+        conn = get_pg_connection()
+        conn.close()
+        return "✅ DB connection successful!"
+    except Exception as e:
+        return f"❌ DB error: {str(e)}"
+
+# ✅ POST /chat
+def split_message(text, max_group_len=280):
+    sentences = re.split(r'(?<=[.!?]) +', text.strip())
+    chunks = []
+    current_chunk = ""
+
+    for sentence in sentences:
+        if len(current_chunk) + len(sentence) <= max_group_len:
+            current_chunk += " " + sentence if current_chunk else sentence
+        else:
+            chunks.append(current_chunk.strip())
+            current_chunk = sentence
+
+    if current_chunk:
+        chunks.append(current_chunk.strip())
+
+    return chunks
+
 
 def get_embedding_from_text(text: str):
     try:
@@ -83,47 +112,11 @@ Only return the updated summary.
 
     return response.choices[0].message.content.strip()
 
-
-
-@app.route('/test-db')
-def test_db():
-    try:
-        conn = get_pg_connection()
-        conn.close()
-        return "✅ DB connection successful!"
-    except Exception as e:
-        return f"❌ DB error: {str(e)}"
-
-
-# ✅ POST /chat
-def split_message(text, max_group_len=280):
-    sentences = re.split(r'(?<=[.!?]) +', text.strip())
-    chunks = []
-    current_chunk = ""
-
-    for sentence in sentences:
-        if len(current_chunk) + len(sentence) <= max_group_len:
-            current_chunk += " " + sentence if current_chunk else sentence
-        else:
-            chunks.append(current_chunk.strip())
-            current_chunk = sentence
-
-    if current_chunk:
-        chunks.append(current_chunk.strip())
-
-    return chunks
-
-
 @app.route("/chat", methods=["POST"])
 def chat_with_daisy():
-    print(f"[DEBUG] Using Assistant ID: {ASSISTANT_ID}")
     data = request.get_json()
     user_id = data.get("userId", "default")
     user_message = data.get("message")
-
-    if not user_message:
-        return jsonify({"error": "Missing message field"}), 400
-
     print(f"[LOG] Message from '{user_id}': {user_message}")
 
     thread_id = THREADS.get(user_id)
@@ -131,22 +124,8 @@ def chat_with_daisy():
         thread = client.beta.threads.create()
         thread_id = thread.id
         THREADS[user_id] = thread_id
-        print(f"[LOG] Created new thread: {thread_id}")
-    else:
-        print(f"[LOG] Using thread: {thread_id}")
-
-    # Add user message to thread
-    client.beta.threads.messages.create(
-        thread_id=thread_id,
-        role="user",
-        content=user_message
-    )
-
-    # Initial assistant run
-    run = client.beta.threads.runs.create(
-        thread_id=thread_id,
-        assistant_id=ASSISTANT_ID,
-    )
+    client.beta.threads.messages.create(thread_id=thread_id, role="user", content=user_message)
+    run = client.beta.threads.runs.create(thread_id=thread_id, assistant_id=ASSISTANT_ID)
 
     while run.status in ["queued", "in_progress"]:
         run = client.beta.threads.runs.retrieve(thread_id=thread_id, run_id=run.id)
@@ -154,73 +133,58 @@ def chat_with_daisy():
     tool_outputs = []
     frontend_images = []
     image_rationales = []
+    tool_used = False
 
-    # Handle tool call like search_curated_images
     if run.status == "requires_action" and run.required_action.type == "submit_tool_outputs":
-        tool_calls = run.required_action.submit_tool_outputs.tool_calls
-        for tool_call in tool_calls:
-            tool_call_id = tool_call.id
-            function_name = tool_call.function.name
-            arguments = json.loads(tool_call.function.arguments)
-
-            if function_name == "search_curated_images":
-                query = arguments.get("query")
-                print(f"[TOOL] Daisy wants to search curated images for: {query}")
+        for tool_call in run.required_action.submit_tool_outputs.tool_calls:
+            args = json.loads(tool_call.function.arguments)
+            if tool_call.function.name == "search_curated_images":
+                tool_used = True
+                query = args.get("query")
+                print(f"[TOOL] Daisy tool call — search_curated_images: {query}")
                 STYLE_SUMMARIES[user_id] = query
-
                 try:
-                    image_results = search_images_from_db(query, user_id)
-                    frontend_images = image_results
-                    image_rationales = [
-                        {"url": img["url"], "rationale": img["explanation"]}
-                        for img in image_results
-                    ]
+                    results = search_images_from_db(query, user_id)
+                    frontend_images = results
+                    image_rationales = [{"url": img["url"], "rationale": img["explanation"]} for img in results]
                     tool_outputs.append({
-                        "tool_call_id": tool_call_id,
-                        "output": json.dumps({ "images": image_results or [] })
+                        "tool_call_id": tool_call.id,
+                        "output": json.dumps({ "images": results or [] })
                     })
                 except Exception as e:
-                    print(f"[ERROR] Failed to fetch images: {e}")
+                    print(f"[ERROR] image search failed: {e}")
                     tool_outputs.append({
-                        "tool_call_id": tool_call_id,
+                        "tool_call_id": tool_call.id,
                         "output": json.dumps({ "images": [] })
                     })
 
-        # Submit tool results
         run = client.beta.threads.runs.submit_tool_outputs(
-            thread_id=thread_id,
-            run_id=run.id,
-            tool_outputs=tool_outputs
+            thread_id=thread_id, run_id=run.id, tool_outputs=tool_outputs
         )
 
-        # Wait for Daisy's follow-up message
         while run.status in ["queued", "in_progress", "requires_action"]:
             run = client.beta.threads.runs.retrieve(thread_id=thread_id, run_id=run.id)
 
-    # Get final assistant message (cleaned of markdown/image lines)
+    # Final reply logic
     messages = client.beta.threads.messages.list(thread_id=thread_id)
+    
     assistant_reply = ""
-
     for m in reversed(messages.data):
         if m.role == "assistant" and m.content:
-            raw_text = m.content[0].text.value.strip()
-            lines = raw_text.splitlines()
+            raw = m.content[0].text.value.strip()
+            lines = raw.splitlines()
+            clean = [line for line in lines if "http" not in line and not line.startswith("-")]
+            assistant_reply = "\n".join(clean).strip()
 
-            # Keep only stylist-style conversation
-            clean_lines = [
-                line for line in lines
-                if not re.match(r"^[-•\\d]", line.strip())  # filters out -, •, 1.
-                and not line.strip().startswith("![")
-                and "http" not in line
-            ]
+            # Check for repetition
+            last_used = LAST_REPLY.get(user_id, "")
+            if assistant_reply == last_used:
+                assistant_reply += "\nLet me take a fresh look at this with you."
+            break
 
-            cleaned_reply = "\n".join(clean_lines).strip()
-            if cleaned_reply:
-                assistant_reply = cleaned_reply
-                break
+    LAST_REPLY[user_id] = assistant_reply
 
     def split_message(text, max_len=280):
-        import re
         sentences = re.split(r'(?<=[.!?]) +', text.strip())
         chunks, chunk = [], ""
         for s in sentences:
@@ -233,13 +197,58 @@ def chat_with_daisy():
             chunks.append(chunk.strip())
         return chunks
 
-    print(f"[LOG] Daisy's real reply (cleaned): {assistant_reply}")
-
     return jsonify({
         "messages": [{"role": "assistant", "text": t} for t in split_message(assistant_reply)],
         "threadId": thread_id,
-        "moodboard": { "images": image_rationales }
+        "moodboard": { "images": image_rationales },
+        "toolUsed": tool_used  # ✅ now included
     })
+
+def search_images_from_db(query, user_id):
+    embedding = get_embedding_from_text(query)
+    STYLE_SUMMARIES[user_id] = query
+
+    conn = get_pg_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT id, stored_image_url, source_url
+        FROM moodboard_items
+        WHERE embedding IS NOT NULL
+        ORDER BY embedding <-> %s::vector
+        LIMIT 10;
+    """, (embedding,))
+    rows = cur.fetchall()
+    conn.close()
+
+    images = [{"id": r["id"], "url": r["stored_image_url"], "source_url": r.get("source_url", "")} for r in rows]
+    image_block = "\n".join(f"{i+1}. {img['url']}" for i, img in enumerate(images))
+
+    prompt = f"""
+    You are a fashion stylist. The user described their style direction as:
+    "{query}"
+
+    You've selected the following fashion images. For each, write a 1–2 sentence stylist explanation in a casual, confident tone. 
+    Speak as a stylist would — no catalogs, no formality. Think: why it works, how to wear it, what vibe it hits.
+
+    Images:
+    {image_block}
+
+    Respond as JSON:
+    [{{ "url": "...", "explanation": "..." }}, ...]
+    Only return JSON.
+    """
+
+    response = client.chat.completions.create(
+        model="gpt-4",
+        messages=[
+            {"role": "system", "content": "You are a fashion stylist writing image rationales."},
+            {"role": "user", "content": prompt}
+        ],
+        temperature=0.7
+    )
+
+    return json.loads(response.choices[0].message.content)
+
 
 # ✅ POST /search-images
 @app.route("/search-images", methods=["POST"])
@@ -357,8 +366,6 @@ Respond ONLY as valid JSON like this:
         return jsonify({"error": str(e)}), 500
 
 
-
-
 # ✅ POST /upload-image
 @app.route('/upload-image', methods=['POST'])
 def upload_image():
@@ -375,68 +382,6 @@ def upload_image():
 
     public_url = f"{SUPABASE_URL}/storage/v1/object/public/moodboard-images/{file_name}"
     return jsonify({"image_url": public_url})
-
-def search_images_from_db(query, user_id):
-    embedding = get_embedding_from_text(query)
-    
-    STYLE_SUMMARIES[user_id] = query
-    
-    conn = get_pg_connection()
-    cursor = conn.cursor()
-
-    sql = """
-    SELECT id, stored_image_url, source_url
-    FROM moodboard_items
-    WHERE embedding IS NOT NULL
-    ORDER BY embedding <-> %s::vector
-    LIMIT 10;
-    """
-    cursor.execute(sql, (embedding,))
-    results = cursor.fetchall()
-    conn.close()
-
-    image_data = [
-        {
-            "id": row["id"],
-            "url": row["stored_image_url"],
-            "source_url": row.get("source_url", "")
-        }
-        for row in results
-    ]
-
-    # Build prompt to send to GPT-4 for rationale generation
-    prompt = f"""
-You are a fashion stylist. Your client described their style direction as:
-"{query}"
-
-You have selected {len(image_data)} fashion images to illustrate this direction. For each image, write 1–2 short sentences explaining *why* it fits the styling goal above.
-
-Images:
-{chr(10).join(f"{i+1}.{img['url']}" for i, img in enumerate(image_data))}
-
-Respond as a JSON array of objects like:
-[
-  {{ "url": "...", "explanation": "..." }},
-  ...
-]
-Only return the JSON.
-""".strip()
-
-    response = client.chat.completions.create(
-        model="gpt-4",
-        messages=[
-            {"role": "system", "content": "You are a fashion stylist writing brief rationales for a curated moodboard."},
-            {"role": "user", "content": prompt}
-        ],
-        temperature=0.7
-    )
-
-    # Parse the assistant's response
-    explanations = json.loads(response.choices[0].message.content)
-
-    return explanations
-
-
 
 
 # Run server
