@@ -66,6 +66,10 @@ def test_db():
 
 # ✅ POST /chat
 def split_message(text, max_group_len=280):
+    if not isinstance(text, str):
+        print("[ERROR] split_message received non-string input:", type(text), repr(text))
+        return ["Let’s see if any of these ideas spark something."]
+
     sentences = re.split(r'(?<=[.!?]) +', text.strip())
     chunks = []
     current_chunk = ""
@@ -111,7 +115,12 @@ Only return the updated summary.
         temperature=0.7
     )
 
-    return response.choices[0].message.content.strip()
+    try:
+        print("[DEBUG] Chat completion response:", response)
+        return response.choices[0].message.content.strip()
+    except (IndexError, AttributeError, KeyError, TypeError) as e:
+        print(f"[ERROR] GPT call failed safely: {e}")
+        return "Updated summary not available — please try again."
 
 # Daisy system prompt (keep full version in actual implementation)
 with open("./backend/prompts/daisy_assistant_prompt.txt", "r") as f:
@@ -130,14 +139,12 @@ def chat_with_daisy():
     if "refine based on feedback" in user_message.lower():
         print("[DEBUG] Triggering refinement from feedback")
 
-        # Get last style summary and user feedback
         prev_summary = STYLE_SUMMARIES.get(user_id, "")
         feedback_map = IMAGE_FEEDBACK.get(user_id, {})
 
         if not feedback_map:
             return jsonify({"messages": [{"role": "assistant", "text": "I haven’t seen your feedback yet — like or dislike a few looks first!"}]}), 200
 
-        # Turn feedback into descriptive text for Daisy
         liked = [k for k, v in feedback_map.items() if v == "like"]
         disliked = [k for k, v in feedback_map.items() if v == "dislike"]
         feedback_description = ""
@@ -147,23 +154,20 @@ def chat_with_daisy():
         if disliked:
             feedback_description += f"You disliked these: {', '.join(disliked[:3])}. "
 
-        # Refine Daisy’s internal style summary
         refined_summary = refine_style_summary(prev_summary, feedback_description)
         STYLE_SUMMARIES[user_id] = refined_summary
 
-        # Pull new images using refined summary
         rationale_output = search_images_from_db(refined_summary, user_id)
         images = rationale_output
         tool_used = True
 
-        # Write follow-up message
         followup_prompt = f"""
-    You just revised the moodboard based on the user's feedback.
+        You just revised the moodboard based on the user's feedback.
 
-    Style summary: "{refined_summary}"
+        Style summary: "{refined_summary}"
 
-    Write a warm, stylish 1–2 sentence comment acknowledging the refinement — and inviting the user to explore the new ideas.
-    """
+        Write a warm, stylish 1–2 sentence comment acknowledging the refinement — and inviting the user to explore the new ideas.
+        """
 
         followup_response = openai.chat.completions.create(
             model="gpt-4",
@@ -174,13 +178,21 @@ def chat_with_daisy():
             temperature=0.7
         )
 
-        assistant_reply = followup_response.choices[0].message.content.strip()
+        print("[DEBUG] GPT raw response:", followup_response)
 
-        # Store reply and return early
+        try:
+            assistant_reply = followup_response.choices[0].message.content.strip()
+            print("[DEBUG] Extracted message:", assistant_reply)
+        except (IndexError, AttributeError, KeyError, TypeError) as e:
+            print(f"[ERROR] GPT call failed safely: {e}")
+            assistant_reply = "Let’s see if any of these ideas spark something."
+
         history = CONVERSATION_HISTORY.get(user_id, [])
         history.append({"role": "assistant", "content": assistant_reply})
         CONVERSATION_HISTORY[user_id] = history
 
+        print("[DEBUG] Final images list to return:", images)
+        
         return jsonify({
             "messages": [{"role": "assistant", "text": assistant_reply}],
             "threadId": "n/a",
@@ -190,31 +202,46 @@ def chat_with_daisy():
 
     print(f"[LOG] Message from '{user_id}': {user_message}")
 
-    # Track user history
     history = CONVERSATION_HISTORY.get(user_id, [])
     history.append({"role": "user", "content": user_message})
 
-    # Trim history to last 3 turns each side
     scoped_history = history[-6:] if len(history) > 6 else history
     messages = [{"role": "system", "content": DAISY_SYSTEM_PROMPT}] + scoped_history
 
     try:
-        # Daisy's main chat response
         response = openai.chat.completions.create(
             model="gpt-4",
             messages=messages,
             temperature=0.8
         )
 
-        assistant_reply = response.choices[0].message.content.strip()
+        print("[DEBUG] GPT raw response:", response)
+
+        try:
+            assistant_reply = response.choices[0].message.content.strip()
+            print("[DEBUG] Extracted message:", assistant_reply)
+        except (IndexError, AttributeError, KeyError) as e:
+            print("[ERROR] Failed to extract assistant reply:", e)
+            assistant_reply = "Let’s see if any of these ideas spark something."
+
+
         tool_used = False
         images = []
 
-        # Check if Daisy wants to style
         if "[[STYLE_SEARCH]]" in assistant_reply:
             assistant_reply = assistant_reply.replace("[[STYLE_SEARCH]]", "").strip()
 
-            # Extract summary for DB search
+            confirm_phrases = ["i'm ready", "lets go", "show me", "cool"]
+            full_context = " ".join([m["content"].lower() for m in scoped_history if m["role"] == "user"])
+            if not any(p in full_context for p in confirm_phrases):
+                assistant_reply = "Gorgeous — let’s make sure I have what I need. Can I ask a few more quick things before I pull ideas?"
+                CONVERSATION_HISTORY[user_id] = history + [{"role": "assistant", "content": assistant_reply}]
+                return jsonify({
+                    "messages": [{"role": "assistant", "text": assistant_reply}],
+                    "threadId": "n/a",
+                    "toolUsed": False
+                })
+
             summary_prompt = f"""
             The user said: "{user_message}"
 
@@ -233,15 +260,21 @@ def chat_with_daisy():
                 temperature=0.7
             )
 
-            style_summary = summary_response.choices[0].message.content.strip()
+            print("[DEBUG] GPT raw response:", summary_response)
+
+            try:
+                style_summary = summary_response.choices[0].message.content.strip()
+                print("[DEBUG] Extracted message:", style_summary)
+            except (IndexError, AttributeError, KeyError, TypeError) as e:
+                print(f"[ERROR] GPT call failed safely: {e}")
+                style_summary = "Minimal creative polish — relaxed layers, artsy edge, nothing forced."
+
             STYLE_SUMMARIES[user_id] = style_summary
 
-            # Get matching images + rationales
             rationale_output = search_images_from_db(style_summary, user_id)
             images = rationale_output
             tool_used = True
 
-            # Extract follow-up moodboard message
             followup_prompt = f"""
             You just showed the user a moodboard with these looks:
 
@@ -260,9 +293,13 @@ def chat_with_daisy():
                 temperature=0.7
             )
 
-            assistant_reply = followup_response.choices[0].message.content.strip()
 
-        # Store Daisy's final reply
+            try:
+                assistant_reply = followup_response.choices[0].message.content.strip()
+            except (IndexError, AttributeError, KeyError, TypeError) as e:
+                print(f"[ERROR] GPT call failed safely: {e}")
+                assistant_reply = "Let’s see if any of these ideas spark something."
+
         history.append({"role": "assistant", "content": assistant_reply})
         CONVERSATION_HISTORY[user_id] = history
 
@@ -279,13 +316,30 @@ def chat_with_daisy():
                 chunks.append(chunk.strip())
             return chunks
 
-        # Ensure we return 'rationale' not 'explanation'
         for img in images:
             if "explanation" in img:
                 img["rationale"] = img.pop("explanation")
 
+        # ✅ Fallback guard in case assistant_reply was never defined
+        if "assistant_reply" not in locals():
+            print("[ERROR] assistant_reply was never defined")
+            assistant_reply = "Let’s see if any of these ideas spark something."
+
+        print("[DEBUG] Type of assistant_reply:", type(assistant_reply))
+        print("[DEBUG] Value of assistant_reply:", assistant_reply)
+
+        # ✅ Safely split assistant reply and ensure all outputs are valid strings
+        messages = []
+        for t in split_message(assistant_reply):
+            if isinstance(t, str):
+                messages.append({"role": "assistant", "text": t})
+            else:
+                print("[ERROR] Invalid text value from split_message:", repr(t))
+                messages.append({"role": "assistant", "text": "Let’s keep going — I’ll refine this idea."})
+
+        # ✅ Safe return block
         return jsonify({
-            "messages": [{"role": "assistant", "text": t} for t in split_message(assistant_reply)],
+            "messages": messages,
             "threadId": "n/a",
             "moodboard": {"images": images},
             "toolUsed": tool_used
@@ -295,7 +349,7 @@ def chat_with_daisy():
     except Exception as e:
         print("[ERROR] OpenAI call failed:", e)
         return jsonify({"error": str(e)}), 500
-    
+
 
 def search_images_from_db(query, user_id):
     embedding = get_embedding_from_text(query)
@@ -307,10 +361,12 @@ def search_images_from_db(query, user_id):
         SELECT id, stored_image_url, source_url, metadata
         FROM moodboard_items
         WHERE embedding IS NOT NULL
+          AND embedding <-> %s::vector < 1.0
         ORDER BY embedding <-> %s::vector
         LIMIT 10;
-    """, (embedding,))
+    """, (embedding, embedding))  # Pass the embedding parameter twice
     rows = cur.fetchall()
+    print("[DEBUG] Retrieved rows from DB:", rows)
     conn.close()
 
     results = []
@@ -323,16 +379,19 @@ def search_images_from_db(query, user_id):
         # Only generate rationale if metadata exists
         if metadata:
             rationale_prompt = f"""
-You are Daisy, a fashion stylist.
+            You are Daisy, a fashion stylist.
 
-Based on the following image metadata, write a short 1–2 sentence stylist explanation for why this image fits the current moodboard direction. Be casual, emotionally intuitive, and insightful — not robotic.
+            The current styling direction is: "{query}"
 
-Metadata:
-{json.dumps(metadata, indent=2)}
+            Use the metadata below to write a short rationale for why this image works within that styling direction. Don’t describe what’s literally in the photo — explain what makes this image a good choice for the vibe. Be intuitive and editorial.
 
-Only return your rationale text. No headers, no formatting.
-"""
+            If the metadata doesn’t seem relevant or the image feels off, keep the rationale very short and honest.
 
+            Metadata:
+            {json.dumps(metadata, indent=2)}
+
+            Only return your rationale. No headers, no formatting.
+            """
             try:
                 response = openai.chat.completions.create(
                     model="gpt-4",
@@ -342,11 +401,16 @@ Only return your rationale text. No headers, no formatting.
                     ],
                     temperature=0.7
                 )
-                rationale = response.choices[0].message.content.strip()
 
+                try:
+                    rationale = response.choices[0].message.content.strip()
+                except (IndexError, AttributeError, KeyError, TypeError) as e:
+                    print(f"[ERROR] GPT call failed safely: {e}")
+                    rationale = "Selected for visual alignment with the style summary."
             except Exception as e:
                 print(f"[ERROR] Rationale generation failed for image {row['id']}: {e}")
                 rationale = "Selected for visual alignment with the style summary."
+
 
         results.append({
             "id": row["id"],
@@ -370,7 +434,6 @@ def record_image_feedback():
     IMAGE_FEEDBACK[user_id][url] = value
     print(f"[FEEDBACK] {user_id} → {value} on {url}")
     return jsonify({"status": "ok"})
-
 
 
 # ✅ POST /search-images
@@ -480,7 +543,12 @@ Respond ONLY as valid JSON like this:
                 return jsonify({"error": f"Run failed: {run_status.status}"}), 500
 
         messages = client.beta.threads.messages.list(thread_id=thread.id)
-        gpt_response = messages.data[0].content[0].text.value.strip()
+
+        try:
+            gpt_response = messages.data[0].content[0].text.value.strip()
+        except (IndexError, AttributeError, KeyError, TypeError) as e:
+            print(f"[ERROR] Final moodboard message parse failed: {e}")
+            return jsonify({"error": "Failed to generate final moodboard summary."}), 500
 
         parsed = json.loads(gpt_response)
         return jsonify(parsed), 200
