@@ -9,6 +9,11 @@ from openai import OpenAI
 import psycopg2
 from psycopg2.extras import RealDictCursor
 import re
+import openai
+
+# OpenAI setup
+openai.api_key = os.getenv("OPENAI_API_KEY")
+
 
 # Load environment variables
 load_dotenv()
@@ -31,6 +36,8 @@ USER_CONTEXTS = {}  # user_id -> { last_user, last_daisy }
 STYLE_SUMMARIES = {}  # user_id -> current style summary
 THREADS = {}  # user_id -> OpenAI thread ID
 LAST_MESSAGE_ID = {}  # user_id -> last assistant message ID
+IMAGE_FEEDBACK = {}  # user_id -> { url: 'like' | 'dislike' }
+
 
 # Database connection
 def get_pg_connection():
@@ -77,14 +84,8 @@ def split_message(text, max_group_len=280):
 
 
 def get_embedding_from_text(text: str):
-    try:
-        response = client.embeddings.create(
-            input=text,
-            model="text-embedding-ada-002"
-        )
-        return response.data[0].embedding
-    except Exception as e:
-        raise RuntimeError(f"OpenAI embedding failed: {str(e)}")
+    response = client.embeddings.create(input=text, model="text-embedding-ada-002")
+    return response.data[0].embedding
 
 
 def refine_style_summary(previous_summary, user_feedback):
@@ -102,7 +103,7 @@ Only return the updated summary.
 """
 
     response = client.chat.completions.create(
-        model="gpt-4",
+        model="gpt-4-turbo",
         messages=[
             { "role": "system", "content": "You are a fashion stylist refining a vibe summary." },
             { "role": "user", "content": prompt }
@@ -112,118 +113,189 @@ Only return the updated summary.
 
     return response.choices[0].message.content.strip()
 
-def get_context_from_state(user_id: str, user_message: str) -> str:
-    style_summary = STYLE_SUMMARIES.get(user_id, "")
-    last_daisy = USER_CONTEXTS.get(user_id, {}).get("last_daisy", "")
+# Daisy system prompt (keep full version in actual implementation)
+with open("./backend/prompts/daisy_assistant_prompt.txt", "r") as f:
+    DAISY_SYSTEM_PROMPT = f.read()
 
-    context_lines = []
-    if style_summary:
-        context_lines.append(f"The user's current style direction: {style_summary}")
-    if last_daisy:
-        context_lines.append(f"Daisy's last message: {last_daisy}")
-    context_lines.append(f"The user's latest message: {user_message}")
-
-    return (
-        "You are Daisy, a warm and intuitive personal stylist. "
-        "Please continue the conversation naturally, focusing on the user's latest message. "
-        "Be thoughtful, stylish, and emotionally intelligent. Avoid repeating earlier phrases.\n\n"
-        + "\n".join(context_lines)
-    )
-
+# In-memory history (swap with Redis or DB for production)
+CONVERSATION_HISTORY = {}
 
 @app.route("/chat", methods=["POST"])
 def chat_with_daisy():
     data = request.get_json()
     user_id = data.get("userId", "default")
     user_message = data.get("message")
+
+    # Special case: user clicked "Refine based on feedback"
+    if "refine based on feedback" in user_message.lower():
+        print("[DEBUG] Triggering refinement from feedback")
+
+        # Get last style summary and user feedback
+        prev_summary = STYLE_SUMMARIES.get(user_id, "")
+        feedback_map = IMAGE_FEEDBACK.get(user_id, {})
+
+        if not feedback_map:
+            return jsonify({"messages": [{"role": "assistant", "text": "I haven’t seen your feedback yet — like or dislike a few looks first!"}]}), 200
+
+        # Turn feedback into descriptive text for Daisy
+        liked = [k for k, v in feedback_map.items() if v == "like"]
+        disliked = [k for k, v in feedback_map.items() if v == "dislike"]
+        feedback_description = ""
+
+        if liked:
+            feedback_description += f"You liked these looks: {', '.join(liked[:3])}. "
+        if disliked:
+            feedback_description += f"You disliked these: {', '.join(disliked[:3])}. "
+
+        # Refine Daisy’s internal style summary
+        refined_summary = refine_style_summary(prev_summary, feedback_description)
+        STYLE_SUMMARIES[user_id] = refined_summary
+
+        # Pull new images using refined summary
+        rationale_output = search_images_from_db(refined_summary, user_id)
+        images = rationale_output
+        tool_used = True
+
+        # Write follow-up message
+        followup_prompt = f"""
+    You just revised the moodboard based on the user's feedback.
+
+    Style summary: "{refined_summary}"
+
+    Write a warm, stylish 1–2 sentence comment acknowledging the refinement — and inviting the user to explore the new ideas.
+    """
+
+        followup_response = openai.chat.completions.create(
+            model="gpt-4",
+            messages=[
+                {"role": "system", "content": "You are Daisy, a stylist refining based on feedback."},
+                {"role": "user", "content": followup_prompt}
+            ],
+            temperature=0.7
+        )
+
+        assistant_reply = followup_response.choices[0].message.content.strip()
+
+        # Store reply and return early
+        history = CONVERSATION_HISTORY.get(user_id, [])
+        history.append({"role": "assistant", "content": assistant_reply})
+        CONVERSATION_HISTORY[user_id] = history
+
+        return jsonify({
+            "messages": [{"role": "assistant", "text": assistant_reply}],
+            "threadId": "n/a",
+            "moodboard": {"images": images},
+            "toolUsed": tool_used
+        })
+
     print(f"[LOG] Message from '{user_id}': {user_message}")
 
-    USER_CONTEXTS[user_id] = USER_CONTEXTS.get(user_id, {})
-    USER_CONTEXTS[user_id]["last_user"] = user_message
+    # Track user history
+    history = CONVERSATION_HISTORY.get(user_id, [])
+    history.append({"role": "user", "content": user_message})
 
-    thread_id = THREADS.get(user_id)
-    if not thread_id:
-        thread = client.beta.threads.create()
-        thread_id = thread.id
-        THREADS[user_id] = thread_id
+    # Trim history to last 3 turns each side
+    scoped_history = history[-6:] if len(history) > 6 else history
+    messages = [{"role": "system", "content": DAISY_SYSTEM_PROMPT}] + scoped_history
 
-    # Compose focused prompt for Daisy
-    context_prompt = get_context_from_state(user_id, user_message)
-    client.beta.threads.messages.create(thread_id=thread_id, role="user", content=context_prompt)
-
-    run = client.beta.threads.runs.create(thread_id=thread_id, assistant_id=ASSISTANT_ID)
-    while run.status in ["queued", "in_progress"]:
-        run = client.beta.threads.runs.retrieve(thread_id=thread_id, run_id=run.id)
-
-    tool_outputs = []
-    frontend_images = []
-    image_rationales = []
-    tool_used = False
-
-    if run.status == "requires_action" and run.required_action.type == "submit_tool_outputs":
-        for tool_call in run.required_action.submit_tool_outputs.tool_calls:
-            args = json.loads(tool_call.function.arguments)
-            if tool_call.function.name == "search_curated_images":
-                tool_used = True
-                query = args.get("query")
-                STYLE_SUMMARIES[user_id] = query
-                results = search_images_from_db(query, user_id)
-                frontend_images = results
-                image_rationales = [
-                    {"url": img["url"], "rationale": img["explanation"]} for img in results
-                ]
-                tool_outputs.append({
-                    "tool_call_id": tool_call.id,
-                    "output": json.dumps({"images": results or []})
-                })
-
-        run = client.beta.threads.runs.submit_tool_outputs(
-            thread_id=thread_id, run_id=run.id, tool_outputs=tool_outputs
+    try:
+        # Daisy's main chat response
+        response = openai.chat.completions.create(
+            model="gpt-4",
+            messages=messages,
+            temperature=0.8
         )
-        while run.status in ["queued", "in_progress", "requires_action"]:
-            run = client.beta.threads.runs.retrieve(thread_id=thread_id, run_id=run.id)
 
-    messages = client.beta.threads.messages.list(thread_id=thread_id)
-    assistant_reply = ""
-    assistant_message_id = None
+        assistant_reply = response.choices[0].message.content.strip()
+        tool_used = False
+        images = []
 
-    for m in reversed(messages.data):
-        if m.role == "assistant" and m.content:
-            assistant_message_id = m.id
-            raw = m.content[0].text.value.strip()
-            if LAST_MESSAGE_ID.get(user_id) == assistant_message_id:
-                print("[DEBUG] Skipping repeated assistant message.")
-                break
-            lines = raw.splitlines()
-            clean = [line for line in lines if "http" not in line and not line.startswith("-")]
-            assistant_reply = "\n".join(clean).strip()
-            break
+        # Check if Daisy wants to style
+        if "[[STYLE_SEARCH]]" in assistant_reply:
+            assistant_reply = assistant_reply.replace("[[STYLE_SEARCH]]", "").strip()
 
-    if assistant_message_id:
-        LAST_MESSAGE_ID[user_id] = assistant_message_id
+            # Extract summary for DB search
+            summary_prompt = f"""
+            The user said: "{user_message}"
 
-    USER_CONTEXTS[user_id]["last_daisy"] = assistant_reply
+            Daisy replied: "{assistant_reply}"
 
-    def split_message(text, max_len=280):
-        sentences = re.split(r'(?<=[.!?]) +', text.strip())
-        chunks, chunk = [], ""
-        for s in sentences:
-            if len(chunk) + len(s) <= max_len:
-                chunk += " " + s if chunk else s
-            else:
+            Now summarize this into a 1–2 sentence styling direction for a fashion image search.
+            Focus on tone, vibe, silhouette, and use descriptive styling language.
+            """
+
+            summary_response = openai.chat.completions.create(
+                model="gpt-4",
+                messages=[
+                    {"role": "system", "content": "You are a stylist summarizing style directions."},
+                    {"role": "user", "content": summary_prompt}
+                ],
+                temperature=0.7
+            )
+
+            style_summary = summary_response.choices[0].message.content.strip()
+            STYLE_SUMMARIES[user_id] = style_summary
+
+            # Get matching images + rationales
+            rationale_output = search_images_from_db(style_summary, user_id)
+            images = rationale_output
+            tool_used = True
+
+            # Extract follow-up moodboard message
+            followup_prompt = f"""
+            You just showed the user a moodboard with these looks:
+
+            "{style_summary}"
+
+            Write a short 1–2 sentence stylist comment that welcomes the user into the board — minimal, stylish, and reflective.
+            DO NOT describe individual items. That will be shown elsewhere.
+            """
+
+            followup_response = openai.chat.completions.create(
+                model="gpt-4",
+                messages=[
+                    {"role": "system", "content": "You are Daisy, summarizing a moodboard you just curated."},
+                    {"role": "user", "content": followup_prompt}
+                ],
+                temperature=0.7
+            )
+
+            assistant_reply = followup_response.choices[0].message.content.strip()
+
+        # Store Daisy's final reply
+        history.append({"role": "assistant", "content": assistant_reply})
+        CONVERSATION_HISTORY[user_id] = history
+
+        def split_message(text, max_len=280):
+            sentences = re.split(r'(?<=[.!?]) +', text.strip())
+            chunks, chunk = [], ""
+            for s in sentences:
+                if len(chunk) + len(s) <= max_len:
+                    chunk += " " + s if chunk else s
+                else:
+                    chunks.append(chunk.strip())
+                    chunk = s
+            if chunk:
                 chunks.append(chunk.strip())
-                chunk = s
-        if chunk:
-            chunks.append(chunk.strip())
-        return chunks
+            return chunks
 
-    return jsonify({
-        "messages": [{"role": "assistant", "text": t} for t in split_message(assistant_reply)],
-        "threadId": thread_id,
-        "moodboard": {"images": image_rationales},
-        "toolUsed": tool_used
-    })
+        # Ensure we return 'rationale' not 'explanation'
+        for img in images:
+            if "explanation" in img:
+                img["rationale"] = img.pop("explanation")
 
+        return jsonify({
+            "messages": [{"role": "assistant", "text": t} for t in split_message(assistant_reply)],
+            "threadId": "n/a",
+            "moodboard": {"images": images},
+            "toolUsed": tool_used
+        })
+
+
+    except Exception as e:
+        print("[ERROR] OpenAI call failed:", e)
+        return jsonify({"error": str(e)}), 500
+    
 
 def search_images_from_db(query, user_id):
     embedding = get_embedding_from_text(query)
@@ -232,7 +304,7 @@ def search_images_from_db(query, user_id):
     conn = get_pg_connection()
     cur = conn.cursor()
     cur.execute("""
-        SELECT id, stored_image_url, source_url
+        SELECT id, stored_image_url, source_url, metadata
         FROM moodboard_items
         WHERE embedding IS NOT NULL
         ORDER BY embedding <-> %s::vector
@@ -241,34 +313,64 @@ def search_images_from_db(query, user_id):
     rows = cur.fetchall()
     conn.close()
 
-    images = [{"id": r["id"], "url": r["stored_image_url"], "source_url": r.get("source_url", "")} for r in rows]
-    image_block = "\n".join(f"{i+1}. {img['url']}" for i, img in enumerate(images))
+    results = []
 
-    prompt = f"""
-    You are a fashion stylist. The user described their style direction as:
-    "{query}"
+    for row in rows:
+        metadata = row.get("metadata")
+        url = row["stored_image_url"]
+        rationale = "This look was selected for its fit with the current style direction."
 
-    You've selected the following fashion images. For each, write a 1–2 sentence stylist explanation in a casual, confident tone. 
-    Speak as a stylist would — no catalogs, no formality. Think: why it works, how to wear it, what vibe it hits.
+        # Only generate rationale if metadata exists
+        if metadata:
+            rationale_prompt = f"""
+You are Daisy, a fashion stylist.
 
-    Images:
-    {image_block}
+Based on the following image metadata, write a short 1–2 sentence stylist explanation for why this image fits the current moodboard direction. Be casual, emotionally intuitive, and insightful — not robotic.
 
-    Respond as JSON:
-    [{{ "url": "...", "explanation": "..." }}, ...]
-    Only return JSON.
-    """
+Metadata:
+{json.dumps(metadata, indent=2)}
 
-    response = client.chat.completions.create(
-        model="gpt-4",
-        messages=[
-            {"role": "system", "content": "You are a fashion stylist writing image rationales."},
-            {"role": "user", "content": prompt}
-        ],
-        temperature=0.7
-    )
+Only return your rationale text. No headers, no formatting.
+"""
 
-    return json.loads(response.choices[0].message.content)
+            try:
+                response = openai.chat.completions.create(
+                    model="gpt-4",
+                    messages=[
+                        {"role": "system", "content": "You are Daisy, a fashion stylist generating rationales."},
+                        {"role": "user", "content": rationale_prompt}
+                    ],
+                    temperature=0.7
+                )
+                rationale = response.choices[0].message.content.strip()
+
+            except Exception as e:
+                print(f"[ERROR] Rationale generation failed for image {row['id']}: {e}")
+                rationale = "Selected for visual alignment with the style summary."
+
+        results.append({
+            "id": row["id"],
+            "url": url,
+            "source_url": row.get("source_url", ""),
+            "rationale": rationale
+        })
+
+    return results
+
+@app.route("/feedback", methods=["POST"])
+def record_image_feedback():
+    data = request.get_json()
+    user_id = data.get("userId", "default")
+    url = data.get("imageUrl")
+    value = data.get("value")  # "like" or "dislike"
+
+    if user_id not in IMAGE_FEEDBACK:
+        IMAGE_FEEDBACK[user_id] = {}
+
+    IMAGE_FEEDBACK[user_id][url] = value
+    print(f"[FEEDBACK] {user_id} → {value} on {url}")
+    return jsonify({"status": "ok"})
+
 
 
 # ✅ POST /search-images
