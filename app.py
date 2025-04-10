@@ -361,7 +361,7 @@ def search_images_from_db(query, user_id):
         SELECT id, stored_image_url, source_url, metadata
         FROM moodboard_items
         WHERE embedding IS NOT NULL
-          AND embedding <-> %s::vector < 1.0
+          -- AND embedding <-> %s::vector < 1.0
         ORDER BY embedding <-> %s::vector
         LIMIT 10;
     """, (embedding, embedding))  # Pass the embedding parameter twice
@@ -379,11 +379,14 @@ def search_images_from_db(query, user_id):
         # Only generate rationale if metadata exists
         if metadata:
             rationale_prompt = f"""
-            You are Daisy, a fashion stylist.
 
-            The current styling direction is: "{query}"
+            You are Daisy, a stylist curating visuals for a client. They’re looking for a vibe that matches this direction: "{query}"
 
-            Use the metadata below to write a short rationale for why this image works within that styling direction. Don’t describe what’s literally in the photo — explain what makes this image a good choice for the vibe. Be intuitive and editorial.
+You’re reviewing this image and its metadata. Write a short, intuitive comment (1–2 sentences) explaining why this image fits. Be stylish and editorial — not formal, literal, or overly descriptive.
+
+Use emotional tone. Never list fabric, pattern, or season unless it's essential to the vibe.
+
+Only return your comment.
 
             If the metadata doesn’t seem relevant or the image feels off, keep the rationale very short and honest.
 
