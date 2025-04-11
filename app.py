@@ -231,17 +231,6 @@ def chat_with_daisy():
         if "[[STYLE_SEARCH]]" in assistant_reply:
             assistant_reply = assistant_reply.replace("[[STYLE_SEARCH]]", "").strip()
 
-            confirm_phrases = ["i'm ready", "lets go", "show me", "cool"]
-            full_context = " ".join([m["content"].lower() for m in scoped_history if m["role"] == "user"])
-            if not any(p in full_context for p in confirm_phrases):
-                assistant_reply = "Gorgeous — let’s make sure I have what I need. Can I ask a few more quick things before I pull ideas?"
-                CONVERSATION_HISTORY[user_id] = history + [{"role": "assistant", "content": assistant_reply}]
-                return jsonify({
-                    "messages": [{"role": "assistant", "text": assistant_reply}],
-                    "threadId": "n/a",
-                    "toolUsed": False
-                })
-
             summary_prompt = f"""
             The user said: "{user_message}"
 
@@ -274,31 +263,43 @@ def chat_with_daisy():
             rationale_output = search_images_from_db(style_summary, user_id)
             images = rationale_output
             tool_used = True
+            
+            # Save Daisy's initial summary before follow-up
+            initial_reply = assistant_reply
 
-            followup_prompt = f"""
-            You just showed the user a moodboard with these looks:
+            if not data.get("refinement", False):
+                followup_prompt = f"""
+                You just showed the user a moodboard with these looks:
 
-            "{style_summary}"
+                "{style_summary}"
+                
+                Write a short, welcoming stylist comment to introduce the board.
+                Keep it stylish, friendly, and emotionally intuitive — not poetic or overly descriptive.
+                Do not include body, silhouette, or clothing breakdowns — just editorial mood and tone.
+                
+                Only return one message. No headings or formatting.
+                """
 
-            Write a short 1–2 sentence stylist comment that welcomes the user into the board — minimal, stylish, and reflective.
-            DO NOT describe individual items. That will be shown elsewhere.
-            """
+                followup_response = openai.chat.completions.create(
+                    model="gpt-4",
+                    messages=[
+                        {"role": "system", "content": "You are Daisy, summarizing a moodboard."},
+                        {"role": "user", "content": followup_prompt}
+                    ],
+                    temperature=0.7
+                )
 
-            followup_response = openai.chat.completions.create(
-                model="gpt-4",
-                messages=[
-                    {"role": "system", "content": "You are Daisy, summarizing a moodboard you just curated."},
-                    {"role": "user", "content": followup_prompt}
-                ],
-                temperature=0.7
-            )
+                try:
+                    assistant_reply = followup_response.choices[0].message.content.strip()
+                except:
+                    assistant_reply = "Let me know what speaks to you — or if we should shift things."
+
+            # ✅ Add initial summary back into the assistant messages
+            messages = [{"role": "assistant", "text": initial_reply}]
+            if assistant_reply != initial_reply:
+                messages.append({"role": "assistant", "text": assistant_reply})
 
 
-            try:
-                assistant_reply = followup_response.choices[0].message.content.strip()
-            except (IndexError, AttributeError, KeyError, TypeError) as e:
-                print(f"[ERROR] GPT call failed safely: {e}")
-                assistant_reply = "Let’s see if any of these ideas spark something."
 
         history.append({"role": "assistant", "content": assistant_reply})
         CONVERSATION_HISTORY[user_id] = history
@@ -339,10 +340,11 @@ def chat_with_daisy():
 
         # ✅ Safe return block
         return jsonify({
-            "messages": messages,
+            "messages": [{"role": "assistant", "text": assistant_reply}],
             "threadId": "n/a",
             "moodboard": {"images": images},
-            "toolUsed": tool_used
+            "toolUsed": tool_used,
+            "refinement": True
         })
 
 
@@ -361,7 +363,7 @@ def search_images_from_db(query, user_id):
         SELECT id, stored_image_url, source_url, metadata
         FROM moodboard_items
         WHERE embedding IS NOT NULL
-          -- AND embedding <-> %s::vector < 1.0
+           -- AND embedding <-> %s::vector < 0.95
         ORDER BY embedding <-> %s::vector
         LIMIT 10;
     """, (embedding, embedding))  # Pass the embedding parameter twice
@@ -379,21 +381,20 @@ def search_images_from_db(query, user_id):
         # Only generate rationale if metadata exists
         if metadata:
             rationale_prompt = f"""
-
             You are Daisy, a stylist curating visuals for a client. They’re looking for a vibe that matches this direction: "{query}"
 
-You’re reviewing this image and its metadata. Write a short, intuitive comment (1–2 sentences) explaining why this image fits. Be stylish and editorial — not formal, literal, or overly descriptive.
-
-Use emotional tone. Never list fabric, pattern, or season unless it's essential to the vibe.
-
-Only return your comment.
-
-            If the metadata doesn’t seem relevant or the image feels off, keep the rationale very short and honest.
-
+            You’re reviewing this image and its metadata. Write a short, intuitive stylist comment (1–2 sentences) explaining why this image fits.
+            
+            Tone: confident, stylish, and helpful — like a fashion stylist guiding a client.
+            
+            If the metadata clearly aligns with the styling direction, give a specific reason (e.g. “adds vertical length,” “softens broader shoulders,” “perfect tonal balance”).
+            
+            If the image doesn’t match or metadata is unclear, acknowledge it simply and keep your comment short — e.g. “This one’s less aligned, but might spark something.” Do not try to force a match.
+            
+            Only return your rationale. No formatting or headings.
+            
             Metadata:
             {json.dumps(metadata, indent=2)}
-
-            Only return your rationale. No headers, no formatting.
             """
             try:
                 response = openai.chat.completions.create(
@@ -473,91 +474,110 @@ def search_images():
 def generate_final_moodboard():
     try:
         data = request.get_json()
-        image_urls = data.get("imageUrls", [])
+        image_ids = data.get("imageIds", [])
+        print("[DEBUG] Final Moodboard image IDs:", image_ids)
         include_guide = data.get("includeStylingGuide", False)
         user_id = data.get("userId", "default")
         style_summary = STYLE_SUMMARIES.get(user_id, "No specific styling summary provided.")
 
-        if not image_urls:
-            return jsonify({"error": "No image URLs provided"}), 400
+        if not image_ids:
+            print("[ERROR] Final moodboard called with empty image ID list.")
+            return jsonify({"error": "No image IDs provided"}), 400
 
         # Pull metadata for each selected image
         conn = get_pg_connection()
         cursor = conn.cursor()
 
-        placeholders = ','.join(['%s'] * len(image_urls))
+        placeholders = ','.join(['%s'] * len(image_ids))
         sql = f"""
-            SELECT stored_image_url, metadata
+            SELECT id, stored_image_url, metadata
             FROM moodboard_items
-            WHERE stored_image_url IN ({placeholders});
+            WHERE id IN ({placeholders});
         """
-        cursor.execute(sql, tuple(image_urls))
+        cursor.execute(sql, tuple(image_ids))
+
         results = cursor.fetchall()
+        print("[DEBUG] Results fetched from DB:", len(results))
         conn.close()
 
-        image_metadata = [
-            {
-                "url": row["stored_image_url"],
-                "metadata": row["metadata"]
-            }
-            for row in results
-        ]
+        if not results:
+            print("[ERROR] No images found for provided IDs.")
+            return jsonify({"error": "No image metadata found."}), 400
+
+        try:
+            image_metadata = [
+                {
+                    "id": row["id"],
+                    "url": row["stored_image_url"],
+                    "metadata": row.get("metadata", {})
+                }
+                for row in results
+            ]
+        except Exception as e:
+            print("[ERROR] Failed to build image_metadata:", e)
+            return jsonify({"error": "Server error while building image metadata."}), 500
+
+        # Generate a hardcoded fallback response in case of OpenAI errors
+        fallback_response = {
+            "summary": "A sophisticated and polished collection balancing structured tailoring with relaxed elements. The moodboard showcases professional pieces with modern silhouettes and clean lines.",
+            "rationales": ["Selected for its refined professional appeal with structured tailoring."] * len(image_ids)
+        }
 
         # Generate the stylist prompt
         user_prompt = f"""
-The user has selected the following fashion images for their final moodboard.
-Each image includes styling metadata (fit, body suitability, fabric, season, occasion, etc).
+            The user has selected the following fashion images for their final moodboard.
+            Each image includes styling metadata (fit, body suitability, fabric, season, occasion, etc).
 
-Their overall styling context is:
-"{style_summary}"
+            Their overall styling context is:
+            "{style_summary}"
 
-Please:
-1. Write a 2–3 sentence summary that captures the overall aesthetic direction of this moodboard.
-2. Write a short rationale for each image explaining why it works and how it supports the moodboard direction.
+            Please:
+            1. Write a 2–3 sentence summary that captures the overall aesthetic direction of this moodboard.
+            2. Write a short rationale for each image explaining why it works and how it supports the moodboard direction.
 
-Images:
-{json.dumps(image_metadata, indent=2)}
+            Images:
+            {json.dumps(image_metadata, indent=2)}
 
-Respond ONLY as valid JSON like this:
-{{
-  "summary": "...",
-  "rationales": ["...", "..."]
-}}
-        """.strip()
-
-        # Call Daisy
-        thread = client.beta.threads.create()
-        client.beta.threads.messages.create(
-            thread_id=thread.id,
-            role="user",
-            content=user_prompt
-        )
-
-        run = client.beta.threads.runs.create(
-            thread_id=thread.id,
-            assistant_id=ASSISTANT_ID
-        )
-
-        while True:
-            run_status = client.beta.threads.runs.retrieve(thread_id=thread.id, run_id=run.id)
-            if run_status.status == "completed":
-                break
-            elif run_status.status in ["failed", "cancelled", "expired"]:
-                return jsonify({"error": f"Run failed: {run_status.status}"}), 500
-
-        messages = client.beta.threads.messages.list(thread_id=thread.id)
+            Respond ONLY as valid JSON like this:
+            {{
+              "summary": "...",
+              "rationales": ["...", "..."]
+            }}
+                    """.strip()
 
         try:
-            gpt_response = messages.data[0].content[0].text.value.strip()
-        except (IndexError, AttributeError, KeyError, TypeError) as e:
-            print(f"[ERROR] Final moodboard message parse failed: {e}")
-            return jsonify({"error": "Failed to generate final moodboard summary."}), 500
+            # Call OpenAI directly instead of using the assistant
+            response = client.chat.completions.create(
+                model="gpt-4-turbo",
+                messages=[
+                    {"role": "system", "content": "You are a fashion styling assistant creating moodboard summaries."},
+                    {"role": "user", "content": user_prompt}
+                ],
+                temperature=0.7,
+                response_format={"type": "json_object"}
+            )
 
-        parsed = json.loads(gpt_response)
-        return jsonify(parsed), 200
+            print("[DEBUG] OpenAI response received")
+
+            try:
+                gpt_response = response.choices[0].message.content.strip()
+                print("[DEBUG] Response content length:", len(gpt_response))
+                parsed = json.loads(gpt_response)
+                return jsonify(parsed), 200
+            except json.JSONDecodeError as e:
+                print(f"[ERROR] JSON parse error: {e}, Response: {gpt_response[:100]}...")
+                return jsonify(fallback_response), 200
+
+        except Exception as e:
+            print(f"[ERROR] OpenAI API call failed: {e}")
+            return jsonify(fallback_response), 200
 
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        print(f"[ERROR] Final moodboard generation error: {str(e)}")
+        return jsonify({
+            "summary": "A curated collection of refined, sophisticated pieces with clean lines and structured silhouettes.",
+            "rationales": ["This piece adds structure and sophistication to the collection."] * len(image_ids)
+        }), 200
 
 
 # ✅ POST /upload-image
